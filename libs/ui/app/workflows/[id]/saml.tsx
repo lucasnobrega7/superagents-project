@@ -2,17 +2,18 @@
 
 import { useCallback, useEffect, useRef, useState } from "react"
 import { useRouter } from "next/navigation"
+import { IngestTaskStatus } from "@/models/models"
 import * as yaml from "js-yaml"
 import * as monaco from "monaco-editor"
 import { useTheme } from "next-themes"
 import { TbCommand } from "react-icons/tb"
+import { toast } from "sonner"
 
 import { exampleConfigs } from "@/config/saml"
 import { Api } from "@/lib/api"
 import { Button } from "@/components/ui/button"
+import { Toaster } from "@/components/ui/sonner"
 import { Spinner } from "@/components/ui/spinner"
-import { Toaster } from "@/components/ui/toaster"
-import { useToast } from "@/components/ui/use-toast"
 
 import { initCodeEditor } from "./editor"
 
@@ -29,6 +30,8 @@ function removeNullValues(obj: any) {
   return newObj
 }
 
+const delay = (ms: number) => new Promise((res) => setTimeout(res, ms))
+
 export default function SAML({
   workflow,
   profile,
@@ -36,8 +39,6 @@ export default function SAML({
   workflow: any
   profile: any
 }) {
-  const { toast } = useToast()
-
   const router = useRouter()
   const latestWorkflowConfig = workflow.workflowConfigs.sort(
     (a: any, b: any) =>
@@ -49,6 +50,8 @@ export default function SAML({
   })
 
   const [isSavingConfig, setSavingConfig] = useState(false)
+
+  const isSaveDisabled = isSavingConfig
 
   const { resolvedTheme } = useTheme()
   const codeEditorRef = useRef(null)
@@ -67,7 +70,7 @@ export default function SAML({
 
   const saveConfig = useCallback(async () => {
     const api = new Api(profile.api_key)
-    if (isSavingConfig) return
+    if (isSaveDisabled) return
     setSavingConfig(true)
 
     const res = await api.generateWorkflow(
@@ -77,20 +80,82 @@ export default function SAML({
 
     const data = await res.json()
 
+    const superRagTasks = data?.data?.superrag_tasks as any[]
+
+    if (superRagTasks) {
+      await Promise.all(
+        superRagTasks?.map(async (task) => {
+          const currentToast = toast(
+            <div className="flex items-center space-x-1 py-1">
+              <Spinner />
+              <span>Ingestion: {task.id} is pending</span>
+            </div>,
+            {
+              closeButton: false,
+              duration: Number.POSITIVE_INFINITY,
+            }
+          )
+
+          let retries = 0
+          const MAX_RETRIES = 3
+
+          async function fetchTask() {
+            // TODO: Don't directly talk to the SuperRag microservice.
+
+            const superRagBaseUrl = `${process.env.NEXT_PUBLIC_SUPERRAG_API_URL}/ingest/tasks/${task.id}?long_polling=true`
+
+            const res = await fetch(superRagBaseUrl.toString())
+            retries++
+
+            const data = await res.json()
+
+            // if request times out, retry
+            if (res.status === 408) {
+              if (retries >= MAX_RETRIES) {
+                toast.error(`Couldn't ingest documents`, {
+                  id: currentToast,
+                  description: `Ingestion: ${task.id} is taking too long to complete, please contact support`,
+                  closeButton: true,
+                })
+                return
+              }
+
+              await delay(3000)
+              await fetchTask()
+              return
+            }
+
+            if (data?.task?.status === IngestTaskStatus.DONE) {
+              toast.success(`Ingestion: ${task.id} is done`, {
+                id: currentToast,
+                duration: 3000,
+                closeButton: true,
+              })
+            } else if (data?.task?.status === IngestTaskStatus.FAILED) {
+              toast.error(`Ingestion: ${task.id} failed`, {
+                id: currentToast,
+                description: data?.task?.error?.message,
+                closeButton: true,
+              })
+            }
+          }
+
+          return fetchTask()
+        })
+      )
+    }
     if (!res.ok) {
       const error = data?.error
-      toast({
-        title: "Something went wrong!",
+      toast.error("Something went wrong.", {
         description: error?.message,
+        duration: Number.POSITIVE_INFINITY,
       })
     } else {
       router.refresh()
-      toast({
-        title: "Config saved!",
-      })
+      toast.success("SAML Saved", { duration: 3000 })
     }
     setSavingConfig(false)
-  }, [isSavingConfig, workflow.id, router, toast, profile.api_key])
+  }, [isSavingConfig, workflow.id, router, profile.api_key])
 
   useEffect(() => {
     editorRef?.current?.addCommand(
@@ -124,7 +189,7 @@ export default function SAML({
             second: "2-digit",
           })}
         </p>
-        <Button size="sm" onClick={() => saveConfig()}>
+        <Button size="sm" disabled={isSaveDisabled} onClick={saveConfig}>
           {isSavingConfig ? <Spinner /> : <span>Save</span>}
         </Button>
       </div>
@@ -176,7 +241,7 @@ export default function SAML({
           </div>
         )}
       </div>
-      <Toaster />
+      <Toaster closeButton />
     </div>
   )
 }
